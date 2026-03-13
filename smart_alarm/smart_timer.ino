@@ -27,6 +27,7 @@
 #include <U8g2lib.h>
 #include "RTClib.h"
 #include <EEPROM.h>
+#include <Preferences.h>
 #include <esp_task_wdt.h>
 
 // ==================== CONFIGURATION ====================
@@ -57,6 +58,7 @@ const char* password = "timer12345";
 U8G2_SH1106_128X64_NONAME_F_SW_I2C display(U8G2_R0, SCL_PIN_OLED, SDA_PIN_OLED, U8X8_PIN_NONE);
 RTC_DS3231 rtc;
 WebServer server(80);
+Preferences prefs;
 
 // flag used when RTC initialization fails to avoid reset loops
 bool rtcAvailable = true;
@@ -65,14 +67,50 @@ bool displayPoweredOn = true;
 
 // ==================== GLOBAL VARIABLES ====================
 #define MAX_PERIODS 210
+#define EXAM_MAX_PERIODS 100
+#define HOLIDAY_MAX_DATES 15
 
-// EEPROM layout:
-// 0: numPeriods
-// 1: timerActive
-// 2.. : periods (6 bytes each)
-// MAGIC at last byte to detect first-run
-#define EEPROM_MAGIC_ADDR 511
-#define EEPROM_MAGIC_VALUE 0xA5
+// ==================== PREFERENCES STORAGE ====================
+// Preferences (NVS) are used for reliability. EEPROM is only used for one-time migration.
+#define PREFS_NAMESPACE "smart_timer"
+#define PREFS_MAGIC_KEY "magic"
+#define PREFS_MAGIC_VALUE 0xB1
+#define PREFS_TIMER_KEY "timer"
+#define PREFS_EXAM_KEY "exam"
+#define PREFS_HOLIDAY_KEY "holiday"
+#define PREFS_EXAMEN_KEY "examEn"
+
+// ==================== EEPROM MIGRATION LAYOUT ====================
+// Old EEPROM layout used EEPROM_SIZE=1024 with hard-coded offsets (400/700). With MAX_PERIODS=210,
+// regular periods alone require 2 + 210*6 = 1262 bytes, which overwrote exam/holiday data and
+// exceeded the 1024-byte EEPROM region. That corruption matches "junk periods" and unstable
+// delete/list behavior.
+#define PERIOD_EEPROM_BYTES 6
+#define EEPROM_SIZE 4096
+
+#define TIMER_DATA_OFFSET 0
+#define TIMER_HEADER_BYTES 2
+#define TIMER_PERIODS_OFFSET (TIMER_DATA_OFFSET + TIMER_HEADER_BYTES)
+#define TIMER_DATA_BYTES (TIMER_HEADER_BYTES + (MAX_PERIODS * PERIOD_EEPROM_BYTES))
+
+#define EXAM_DATA_OFFSET (TIMER_DATA_OFFSET + TIMER_DATA_BYTES)
+#define EXAM_HEADER_BYTES 3
+#define EXAM_PERIODS_OFFSET (EXAM_DATA_OFFSET + EXAM_HEADER_BYTES)
+#define EXAM_DATA_BYTES (EXAM_HEADER_BYTES + (EXAM_MAX_PERIODS * PERIOD_EEPROM_BYTES))
+
+#define HOLIDAY_DATA_OFFSET (EXAM_DATA_OFFSET + EXAM_DATA_BYTES)
+#define HOLIDAY_ENTRY_BYTES 4
+
+#define EEPROM_MAGIC_ADDR (EEPROM_SIZE - 1)
+// Bumped to force a one-time migration path from the old, overlapping layout.
+#define EEPROM_MAGIC_VALUE 0xA6
+
+// Old layout support (best-effort migration)
+#define EEPROM_OLD_MAGIC_VALUE 0xA5
+#define EEPROM_OLD_SIZE 1024
+#define EEPROM_OLD_MAGIC_ADDR (EEPROM_OLD_SIZE - 1)
+#define EEPROM_OLD_EXAM_DATA_OFFSET 400
+#define EEPROM_OLD_HOLIDAY_DATA_OFFSET 700
 
 struct Period {
   uint8_t day; // 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
@@ -88,6 +126,40 @@ struct TimerData {
   bool timerActive = false;
 };
 
+struct ExamData {
+  Period periods[MAX_PERIODS];
+  uint8_t numPeriods = 0;
+  bool timerActive = false;
+};
+
+struct HolidayDate {
+  uint16_t year;
+  uint8_t month;
+  uint8_t day;
+};
+
+struct HolidayData {
+  HolidayDate dates[HOLIDAY_MAX_DATES];
+  uint8_t numDates = 0;
+};
+
+struct StoredTimerData {
+  uint8_t numPeriods;
+  uint8_t timerActive;
+  Period periods[MAX_PERIODS];
+} __attribute__((packed));
+
+struct StoredExamData {
+  uint8_t numPeriods;
+  uint8_t timerActive;
+  Period periods[MAX_PERIODS];
+} __attribute__((packed));
+
+struct StoredHolidayData {
+  uint8_t numDates;
+  HolidayDate dates[HOLIDAY_MAX_DATES];
+} __attribute__((packed));
+
 struct RelayState {
   bool isActive = false;
   unsigned long activationTime = 0;
@@ -95,11 +167,15 @@ struct RelayState {
 };
 
 TimerData timerData;
+ExamData examData;
+HolidayData holidayData;
+bool examModeEnabled = false;
 RelayState relayState;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastScheduleCheck = 0;
 
 // button state tracking
+bool apActive = true;
 int lastButtonState = HIGH;
 unsigned long buttonPressStart = 0;
 
@@ -107,25 +183,42 @@ unsigned long buttonPressStart = 0;
 int wifiScrollOffset = SCREEN_WIDTH;
 
 // ==================== FORWARD DECLARATIONS ====================
-void loadDataFromEEPROM();
-void saveDataToEEPROM();
+void loadDataFromPreferences();
+void saveDataToPreferences();
 void setupWebServer();
 void handleRoot();
 void handleGetTime();
 void handleSetTime();
 void handleGetPeriods();
+void handleGetHolidays();
 void handleAddPeriod();
+void handleAddHoliday();
 void handleDeletePeriod();
+void handleDeleteHoliday();
 void handleClearPeriods();
+void handleClearHolidays();
 void handleEditPeriod();
 void handleStartTimer();
 void handleStopTimer();
 void handleTrigger();
 void handleNotFound();
+void handleSetExamMode();
+void handleGetExamPeriods();
+void handleAddExamPeriod();
+void handleDeleteExamPeriod();
+void handleClearExamPeriods();
+void handleEditExamPeriod();
+void handleStartExamTimer();
+void handleStopExamTimer();
 void checkAndExecuteSchedules();
 void updateDisplay();
 void handleButtonPress();
-String getHTMLContent();
+const char* getHTMLContent();
+bool isHolidayToday(const DateTime &now);
+bool isValidStoredPeriod(const Period &p);
+bool periodEquals(const Period &a, const Period &b);
+bool hasDuplicateInTimerData(const Period &p, int uptoExclusive);
+bool migrateFromEepromIfPresent();
 
 // ==================== INITIALIZATION ====================
 void setup() {
@@ -137,9 +230,9 @@ void setup() {
   // The watchdog would trigger if the main loop is blocked for too long
   disableWatchdog();
   
-  // Initialize EEPROM for storing timer data
-  EEPROM.begin(512);
-  //Serial.print.println("[SETUP] EEPROM initialized");
+  // Initialize Preferences for storing timer data
+  prefs.begin(PREFS_NAMESPACE, false);
+  //Serial.print.println("[SETUP] Preferences initialized");
   
   // Initialize GPIO early
   pinMode(TIMER_OUTPUT_PIN, OUTPUT);
@@ -168,7 +261,7 @@ void setup() {
   initializeRTC();
   
   // Load saved data from EEPROM
-  loadDataFromEEPROM();
+  loadDataFromPreferences();
   
   // Initialize WiFi
   //Serial.print.println("[SETUP] Starting WiFi AP...");
@@ -211,6 +304,20 @@ void loop() {
   }
 }
 
+/* Function to start wifi*/
+void startWiFiAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  apActive = true;
+}
+
+/* Function to stop wifi*/
+void stopWiFiAP() {
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  apActive = false;
+}
+
 // called from loop() to watch the user button
 void checkButton() {
   int state = digitalRead(BUTTON_PIN);
@@ -221,16 +328,19 @@ void checkButton() {
       unsigned long dur = millis() - buttonPressStart;
       if (dur >= 5000) {               // long press – toggle OLED
         if (displayAvailable) {
-          if (displayPoweredOn) {
+          if (displayPoweredOn && apActive) {
             display.setPowerSave(1);    // turn display off
             displayPoweredOn = false;
-          } else {
+            stopWiFiAP();
+          } 
+          else {
             display.setPowerSave(0);    // turn display back on
             displayPoweredOn = true;
+            startWiFiAP();
           }
         }
       } else if (dur >= 1000) {        // medium press – 2‑second output
-        triggerTimer(2);
+        triggerTimer(10);
       }
     }
     lastButtonState = state;
@@ -250,6 +360,7 @@ bool initializeDisplay() {
     display.setFont(u8g2_font_10x20_tf);
     display.drawStr(16, 30, "Ayinostech");
     display.sendBuffer();
+    delay(2500);
     //Serial.print.println("[DISP] Display initialized successfully");
     return true;
   } catch (...) {
@@ -295,7 +406,7 @@ void updateDisplay() {
   // Line 1: date with nice formatting (Y=10)
   safeDisplaySetFont(u8g2_font_7x13_tf);
   const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-  snprintf(buffer, sizeof(buffer), "%s %d/%d/%04d", dayNames[now.dayOfTheWeek()], now.day(), now.month(), now.year());
+  snprintf(buffer, sizeof(buffer), "%s %d/%d/%04d  %s", dayNames[now.dayOfTheWeek()], now.day(), now.month(), now.year(), examModeEnabled ? "Exm" : "Reg");
   safeDisplayDrawStr(0, 10, buffer);
   if (rtcAvailable && rtc.lostPower()) {
     safeDisplayDrawStr(100, 10, "LOW");
@@ -313,32 +424,74 @@ void updateDisplay() {
   
   // Line 3: status and next scheduled (Y=48)
   safeDisplaySetFont(u8g2_font_6x10_tf);
-  snprintf(buffer, sizeof(buffer), "Periods:%d Active:%s", timerData.numPeriods, timerData.timerActive ? "YES" : "NO");
+  // Show exam-mode status when enabled
+  int periodsCount = examModeEnabled ? examData.numPeriods : timerData.numPeriods;
+  bool periodsActive = examModeEnabled ? examData.timerActive : timerData.timerActive;
+  snprintf(buffer, sizeof(buffer), "%sPeriods:%d Active:%s", examModeEnabled ? "" : "", periodsCount, periodsActive ? "YES" : "NO");
   safeDisplayDrawStr(0, 48, buffer);
-  
-  // compute next scheduled event
+
+  // compute next scheduled event for the active mode
   uint8_t currentDay = now.dayOfTheWeek();
   uint32_t currentSeconds = (now.hour() * 3600) + (now.minute() * 60) + now.second();
   int nextIndex = -1;
   uint32_t minDiff = UINT32_MAX;
-  for (int i = 0; i < timerData.numPeriods; i++) {
-    if (timerData.periods[i].day == currentDay) {
-      uint32_t periodSeconds = (timerData.periods[i].hour * 3600) + (timerData.periods[i].minute * 60) + timerData.periods[i].second;
-      if (periodSeconds >= currentSeconds) {
-        uint32_t diff = periodSeconds - currentSeconds;
-        if (diff < minDiff) {
-          minDiff = diff;
-          nextIndex = i;
+  if (examModeEnabled) {
+    for (int i = 0; i < examData.numPeriods; i++) {
+      if (examData.periods[i].day == currentDay) {
+        uint32_t periodSeconds = (examData.periods[i].hour * 3600) + (examData.periods[i].minute * 60) + examData.periods[i].second;
+        if (periodSeconds >= currentSeconds) {
+          uint32_t diff = periodSeconds - currentSeconds;
+          if (diff < minDiff) {
+            minDiff = diff;
+            nextIndex = i;
+          }
         }
       }
     }
-  }
-  if (nextIndex >= 0) {
-    snprintf(buffer, sizeof(buffer), "Next: %02d:%02d:%02d", 
-             timerData.periods[nextIndex].hour,
-             timerData.periods[nextIndex].minute,
-             timerData.periods[nextIndex].second);
-    safeDisplayDrawStr(0, 60, buffer);
+    if (nextIndex >= 0 && !isHolidayToday(rtc.now())) {
+      snprintf(buffer, sizeof(buffer), periodsActive ? "Next: %02d:%02d:%02d" : "", 
+               examData.periods[nextIndex].hour,
+               examData.periods[nextIndex].minute,
+               examData.periods[nextIndex].second);
+      safeDisplayDrawStr(0, 60, buffer);
+    }
+    else if (isHolidayToday(rtc.now())) {
+      snprintf(buffer, sizeof(buffer), "Holiday Today"); 
+      safeDisplayDrawStr(20, 60, buffer);
+    }
+    else {
+      snprintf(buffer, sizeof(buffer), ""); 
+      safeDisplayDrawStr(20, 60, buffer);
+    }
+
+  } else {
+    for (int i = 0; i < timerData.numPeriods; i++) {
+      if (timerData.periods[i].day == currentDay) {
+        uint32_t periodSeconds = (timerData.periods[i].hour * 3600) + (timerData.periods[i].minute * 60) + timerData.periods[i].second;
+        if (periodSeconds >= currentSeconds) {
+          uint32_t diff = periodSeconds - currentSeconds;
+          if (diff < minDiff) {
+            minDiff = diff;
+            nextIndex = i;
+          }
+        }
+      }
+    }
+    if (nextIndex >= 0 && !isHolidayToday(rtc.now())) {
+      snprintf(buffer, sizeof(buffer), periodsActive ? "Next: %02d:%02d:%02d" : "", 
+               timerData.periods[nextIndex].hour,
+               timerData.periods[nextIndex].minute,
+               timerData.periods[nextIndex].second);
+      safeDisplayDrawStr(0, 60, buffer);
+    }
+    else if (isHolidayToday(rtc.now())) {
+      snprintf(buffer, sizeof(buffer), "Holiday Today"); 
+      safeDisplayDrawStr(20, 60, buffer);
+    }
+    else {
+      snprintf(buffer, sizeof(buffer), ""); 
+      safeDisplayDrawStr(20, 60, buffer);
+    }
   }
 
   // scrolling wifi/ssid info at very bottom
@@ -389,6 +542,29 @@ int normalizeDay(int d) {
   return -1;
 }
 
+static inline bool isValidStoredDay(uint8_t d) { return d <= 6; }
+
+bool isValidStoredPeriod(const Period &p) {
+  return isValidStoredDay(p.day) &&
+         isValidTime((int)p.hour, (int)p.minute, (int)p.second) &&
+         isValidDelay((int)p.delaySeconds);
+}
+
+bool periodEquals(const Period &a, const Period &b) {
+  return a.day == b.day &&
+         a.hour == b.hour &&
+         a.minute == b.minute &&
+         a.second == b.second &&
+         a.delaySeconds == b.delaySeconds;
+}
+
+bool hasDuplicateInTimerData(const Period &p, int uptoExclusive) {
+  for (int i = 0; i < uptoExclusive; i++) {
+    if (periodEquals(timerData.periods[i], p)) return true;
+  }
+  return false;
+}
+
 void initializeRTC() {
   if (!rtc.begin()) {
     rtcAvailable = false;
@@ -425,31 +601,77 @@ void setRTCTime(uint8_t hour, uint8_t minute, uint8_t second) {
 }
 
 // ==================== TIMER FUNCTIONS ====================
+bool isHolidayToday(const DateTime &now) {
+  for (int i = 0; i < holidayData.numDates; i++) {
+    const HolidayDate &h = holidayData.dates[i];
+    if (h.year == now.year() && h.month == now.month() && h.day == now.day()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void checkAndExecuteTimer() {
-  if (!timerData.timerActive) return;
-  if (!rtcAvailable) return;
-  
-  DateTime now = rtc.now();
-  uint8_t currentDay = now.dayOfTheWeek(); // 0=Sun, 1=Mon, ..., 6=Sat
-  uint32_t currentSeconds = (now.hour() * 3600) + (now.minute() * 60) + now.second();
-  
-  static uint32_t lastTriggeredSeconds = UINT32_MAX;
-  
-  // Check if we've already triggered this second
-  if (lastTriggeredSeconds == currentSeconds) {
-    return; // Already triggered in this second
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    if (isHolidayToday(now)) {
+      // Suppress all timer actions on holiday dates and ensure relay stays OFF.
+      if (relayState.isActive) {
+        digitalWrite(TIMER_OUTPUT_PIN, LOW);
+        relayState.isActive = false;
+      }
+      return;
+    }
+  }
+
+  // Check normal timer
+  if (timerData.timerActive && rtcAvailable) {
+    DateTime now = rtc.now();
+    uint8_t currentDay = now.dayOfTheWeek(); // 0=Sun, 1=Mon, ..., 6=Sat
+    uint32_t currentSeconds = (now.hour() * 3600) + (now.minute() * 60) + now.second();
+    
+    static uint32_t lastTriggeredSeconds = UINT32_MAX;
+    
+    // Check if we've already triggered this second
+    if (lastTriggeredSeconds != currentSeconds) {
+      for (int i = 0; i < timerData.numPeriods; i++) {
+        Period &p = timerData.periods[i];
+        if (p.day == currentDay) {
+          uint32_t periodSeconds = (p.hour * 3600) + (p.minute * 60) + p.second;
+          if (currentSeconds == periodSeconds) {
+            ////Serial.print.printf("[TIMER] Triggered at %02d:%02d:%02d on day %d (delay=%d sec)\n", 
+                          // p.hour, p.minute, p.second, p.day, p.delaySeconds);
+            triggerTimer(p.delaySeconds);
+            lastTriggeredSeconds = currentSeconds;
+            break; // Trigger only one at a time
+          }
+        }
+      }
+    }
   }
   
-  for (int i = 0; i < timerData.numPeriods; i++) {
-    Period &p = timerData.periods[i];
-    if (p.day == currentDay) {
-      uint32_t periodSeconds = (p.hour * 3600) + (p.minute * 60) + p.second;
-      if (currentSeconds == periodSeconds) {
-        ////Serial.print.printf("[TIMER] Triggered at %02d:%02d:%02d on day %d (delay=%d sec)\n", 
-                      // p.hour, p.minute, p.second, p.day, p.delaySeconds);
-        triggerTimer(p.delaySeconds);
-        lastTriggeredSeconds = currentSeconds;
-        break; // Trigger only one at a time
+  // Check exam timer
+  if (examData.timerActive && rtcAvailable) {
+    DateTime now = rtc.now();
+    uint8_t currentDay = now.dayOfTheWeek(); // 0=Sun, 1=Mon, ..., 6=Sat
+    uint32_t currentSeconds = (now.hour() * 3600) + (now.minute() * 60) + now.second();
+    
+    static uint32_t lastExamTriggeredSeconds = UINT32_MAX;
+    
+    // Check if we've already triggered this second
+    if (lastExamTriggeredSeconds != currentSeconds) {
+      for (int i = 0; i < examData.numPeriods; i++) {
+        Period &p = examData.periods[i];
+        if (p.day == currentDay) {
+          uint32_t periodSeconds = (p.hour * 3600) + (p.minute * 60) + p.second;
+          if (currentSeconds == periodSeconds) {
+            ////Serial.print.printf("[EXAM TIMER] Triggered at %02d:%02d:%02d on day %d (delay=%d sec)\n", 
+                          // p.hour, p.minute, p.second, p.day, p.delaySeconds);
+            triggerTimer(p.delaySeconds);
+            lastExamTriggeredSeconds = currentSeconds;
+            break; // Trigger only one at a time
+          }
+        }
       }
     }
   }
@@ -544,13 +766,28 @@ void setupWebServer() {
   server.on("/api/time", handleGetTime);
   server.on("/api/settime", handleSetTime);
   server.on("/api/periods", handleGetPeriods);
+  server.on("/api/holidays", handleGetHolidays);
   server.on("/api/addperiod", handleAddPeriod);
+  server.on("/api/addholiday", handleAddHoliday);
   server.on("/api/deleteperiod", handleDeletePeriod);
+  server.on("/api/deleteholiday", handleDeleteHoliday);
   server.on("/api/clearperiods", handleClearPeriods);
+  server.on("/api/clearholidays", handleClearHolidays);
   server.on("/api/editperiod", handleEditPeriod);      // new endpoint for editing
   server.on("/api/starttimer", handleStartTimer);
   server.on("/api/stoptimer", handleStopTimer);
   server.on("/api/trigger", handleTrigger);            // manual trigger API
+  
+  // Exam mode endpoints
+  server.on("/api/setexammode", handleSetExamMode);
+  server.on("/api/examperiods", handleGetExamPeriods);
+  server.on("/api/addexamperiod", handleAddExamPeriod);
+  server.on("/api/deleteexamperiod", handleDeleteExamPeriod);
+  server.on("/api/clearexamperiods", handleClearExamPeriods);
+  server.on("/api/editexamperiod", handleEditExamPeriod);
+  server.on("/api/startexamtimer", handleStartExamTimer);
+  server.on("/api/stopexamtimer", handleStopExamTimer);
+  
   server.onNotFound(handleNotFound);
   
   server.begin();
@@ -558,12 +795,11 @@ void setupWebServer() {
 }
 
 void handleRoot() {
-  String html = getHTMLContent();
-  server.send(200, "text/html", html);
+  server.send_P(200, "text/html", getHTMLContent());
 }
 
-String getHTMLContent() {
-  return R"rawliteral(
+const char* getHTMLContent() {
+  static const char html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -605,7 +841,7 @@ String getHTMLContent() {
         
         .subtitle {
             text-align: center;
-            color: #666;
+            color: #00008B;
             margin-bottom: 30px;
             font-size: 14px;
         }
@@ -834,6 +1070,110 @@ String getHTMLContent() {
             display: none;
         }
         
+        /* Toggle Switch Styles */
+        .toggle-mode-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            gap: 15px;
+        }
+        
+        .mode-label {
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+            min-width: 80px;
+            text-align: right;
+        }
+        
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 28px;
+        }
+        
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: 0.4s;
+            border-radius: 34px;
+        }
+        
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 22px;
+            width: 22px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: 0.4s;
+            border-radius: 50%;
+        }
+        
+        input:checked + .toggle-slider {
+            background-color: #667eea;
+        }
+        
+        input:checked + .toggle-slider:before {
+            transform: translateX(22px);
+        }
+        
+        .exam-mode-label {
+            font-size: 14px;
+            font-weight: 600;
+            color: #00;
+            min-width: 80px;
+        }
+        
+        /* Hidden sections */
+        .normal-mode-section {
+            display: block;
+        }
+        
+        .normal-mode-section.hidden {
+            display: none;
+        }
+        
+        .exam-mode-section {
+            display: none;
+        }
+        
+        .exam-mode-section.visible {
+            display: block;
+        }
+
+        .delete-btn {
+            background: #ff6b6b;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 5px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            flex: 0 0 auto;
+        }
+
+        .title-gold {
+            font-size: 26px;
+            background: linear-gradient(45deg,#FFD700,#D4AF37,#B8962E);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
         @media (max-width: 480px) {
             .container {
                 padding: 25px;
@@ -847,16 +1187,41 @@ String getHTMLContent() {
                 width: 70px;
                 font-size: 16px;
             }
+            
+            .toggle-mode-container {
+                flex-direction: row;
+                gap: 10px;
+            }
+            
+            .mode-label {
+                text-align: center;
+                min-width: auto;
+            }
+            
+            .exam-mode-label {
+                text-align: center;
+                min-width: auto;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>⏱ Smart School Timer</h1>
-        <p class="subtitle">Control your automated scheduler</p>
+        <h1 class="title-gold">⏱ Smart School Timer</h1>
+        <p class="subtitle">Powered by Ayinostech</p>
+        
+        <!-- Mode Toggle Button -->
+        <div class="toggle-mode-container">
+            <span class="mode-label">Regular</span>
+            <label class="toggle-switch">
+                <input type="checkbox" id="examModeToggle" onchange="toggleExamMode()">
+                <span class="toggle-slider"></span>
+            </label>
+            <span class="exam-mode-label">Exam</span>
+        </div>
         
         <!-- Current Time Display -->
-        <div class="section">
+        <div class="section normal-mode-section" id="timeDisplaySection">
             <div class="section-title">Current Date & Time on Timer</div>
             <div class="status-display">
                 <div class="status-label">Current Date & Time</div>
@@ -867,7 +1232,7 @@ String getHTMLContent() {
         </div>
         
         <!-- Set Time Section -->
-        <div class="section">
+        <div class="section normal-mode-section" id="setTimeSection">
             <div class="section-title">Set Current Date & Time<br>(YYYY-MM-DD HH:MM:SS)</div>
             <div class="date-time-input-group" style="margin-bottom: 15px;">
                 <input type="number" id="setYear" class="time-input" min="2020" max="2099" placeholder="2026" style="width: 100px;">
@@ -899,7 +1264,7 @@ String getHTMLContent() {
         </div>
         
         <!-- Add Time Period Section -->
-        <div class="section">
+        <div class="section normal-mode-section" id="addPeriodSection">
             <div class="section-title">Add Scheduled Period</div>
             <!-- mode selector: which days should receive this period -->
             <div style="margin-bottom: 15px; text-align: center;">
@@ -907,8 +1272,8 @@ String getHTMLContent() {
                 <select id="periodMode" class="time-input" style="width:150px; margin-right:10px;">
                     <option value="single" selected>Single day</option>
                     <option value="weekdays">Mon‑Fri</option>
-                    <option value="saturday">Saturday only</option>
-                    <option value="everyday">All days</option>
+                    <option value="mon_to_thu">Mon‑Thu</option>
+                    <option value="everyday">Sun-Sat</option>
                 </select>
             </div>
             <div style="margin-bottom: 15px;">
@@ -942,14 +1307,14 @@ String getHTMLContent() {
             </div>
             <div style="margin-bottom: 15px; text-align: center;">
                 <span style="font-size: 12px; color: #666; margin-right: 10px;">Delay (0–60s):</span>
-                <input type="number" id="periodDelay" class="time-input" min="0" max="60" placeholder="60" style="width: 100px;">
+                <input type="number" id="periodDelay" class="time-input" min="0" max="60" placeholder="00" style="width: 100px;">
                 <span style="font-size: 12px; color: #666; margin-left: 5px;">seconds</span>
             </div>
-            <button class="btn-primary" onclick="addPeriod()">Add Period</button>
+            <button id="addPeriodBtn" class="btn-primary" onclick="addPeriod()">Add Period</button>
         </div>
         
         <!-- Periods List Section -->
-        <div class="section">
+        <div class="section normal-mode-section" id="periodsListSection">
             <div class="section-title">Scheduled Periods</div>
             <div id="periodsList" class="status-display" style="text-align: left; max-height: 200px; overflow-y: auto;">
                 <div class="status-label">No periods added yet.</div>
@@ -958,9 +1323,29 @@ String getHTMLContent() {
               <button class="btn-danger" style="padding:8px 12px; font-size:12px;" onclick="clearAllPeriods()">Clear All Periods</button>
             </div>
         </div>
+
+        <!-- Holiday Dates Section (date only) -->
+        <div class="section normal-mode-section" id="holidaySection">
+            <div class="section-title">Holiday Dates (YYYY-MM-DD)</div>
+            <div class="date-time-input-group" style="margin-bottom: 15px;">
+                <input type="number" id="holidayYear" class="time-input" min="2000" max="2099" placeholder="2026" style="width: 100px;">
+                <span class="separator">-</span>
+                <input type="number" id="holidayMonth" class="time-input" min="1" max="12" placeholder="01" style="width: 70px;">
+                <span class="separator">-</span>
+                <input type="number" id="holidayDay" class="time-input" min="1" max="31" placeholder="01" style="width: 70px;">
+            </div>
+            <button class="btn-primary" onclick="addHoliday()">Add Holiday Date</button>
+            <div id="holidayTodayBadge" class="status-label" style="margin-top: 10px; text-align:center; font-weight:600;"></div>
+            <div id="holidaysList" class="status-display" style="text-align: left; max-height: 180px; overflow-y: auto; margin-top: 10px;">
+                <div class="status-label">No holidays added yet.</div>
+            </div>
+            <div style="margin-top:8px; text-align: right;">
+              <button class="btn-danger" style="padding:8px 12px; font-size:12px;" onclick="clearAllHolidays()">Clear All Holidays</button>
+            </div>
+        </div>
         
-        <!-- Manual Trigger Section for real-time testing -->
-        <div class="section">
+        <!-- Manual Trigger Section for real-time testing 
+        <div class="section normal-mode-section" id="manualTriggerSection">
             <div class="section-title">Manual Trigger (Emergency Bell)</div>
             <div style="margin-bottom: 15px; text-align: center;">
                 <span style="font-size: 12px; color: #666; margin-right: 10px;">Delay:</span>
@@ -969,9 +1354,10 @@ String getHTMLContent() {
             </div>
             <button class="btn-secondary" onclick="triggerNow()">Trigger Now</button>
         </div>
+        -->
         
         <!-- Timer Status Section -->
-        <div class="section">
+        <div class="section normal-mode-section" id="timerControlSection">
             <div class="section-title">Timer Control (ON/OFF)</div>
             <div id="timerStatus" class="timer-status status-inactive">
                 ⭕ Timer is INACTIVE
@@ -979,6 +1365,66 @@ String getHTMLContent() {
             <div class="button-group">
                 <button class="btn-primary" onclick="startTimer()">Timer ON</button>
                 <button class="btn-danger" onclick="stopTimer()">Timer OFF</button>
+            </div>
+        </div>
+        
+        <!-- EXAM MODE SECTIONS -->
+        
+        <!-- Add Exam Period Section -->
+        <div class="section exam-mode-section" id="addExamPeriodSection">
+            <div class="section-title">Add Exam Schedule</div>
+            <!-- mode selector: only Mon-Fri, Mon-Thu, and Mon-Sat -->
+            <div style="margin-bottom: 15px; text-align: center;">
+                <label for="examPeriodMode" style="font-size:12px; color:#666; margin-right:5px;">Apply to:</label>
+                <select id="examPeriodMode" class="time-input" style="width:150px; font-size:16px; margin-right:10px;">
+                    <option value="weekdays" style="font-size:16px;" selected>Mon - Fri</option>
+                    <option value="monfri" style="font-size:16px;">Mon - Sat</option>
+                </select>
+            </div>
+            <div class="time-input-group" style="display: flex; justify-content: center; gap: 5px; margin-bottom: 15px;">
+                <div>
+                    <input type="number" id="examPeriodHour" class="time-input" min="0" max="23" placeholder="00">
+                    <div class="label">Hour</div>
+                </div>
+                <div class="separator">:</div>
+                <div>
+                    <input type="number" id="examPeriodMinute" class="time-input" min="0" max="59" placeholder="00">
+                    <div class="label">Minute</div>
+                </div>
+                <div class="separator">:</div>
+                <div>
+                    <input type="number" id="examPeriodSecond" class="time-input" min="0" max="59" placeholder="00">
+                    <div class="label">Second</div>
+                </div>
+            </div>
+            <div style="margin-bottom: 15px; text-align: center;">
+                <span style="font-size: 12px; color: #666; margin-right: 10px;">Delay (0–60s):</span>
+                <input type="number" id="examPeriodDelay" class="time-input" min="0" max="60" placeholder="00" style="width: 100px;">
+                <span style="font-size: 12px; color: #666; margin-left: 5px;">seconds</span>
+            </div>
+            <button class="btn-primary" onclick="addExamPeriod()">Add Schedule</button>
+        </div>
+        
+        <!-- Exam Periods List Section -->
+        <div class="section exam-mode-section" id="examPeriodsListSection">
+            <div class="section-title">Exam Schedules</div>
+            <div id="examPeriodsList" class="status-display" style="text-align: left; max-height: 200px; overflow-y: auto;">
+                <div class="status-label">No exam schedules added yet.</div>
+            </div>
+            <div style="margin-top:8px; text-align: right;">
+              <button class="btn-danger" style="padding:8px 12px; font-size:12px;" onclick="clearAllExamPeriods()">Clear All</button>
+            </div>
+        </div>
+        
+        <!-- Exam Timer Control Section -->
+        <div class="section exam-mode-section" id="examTimerControlSection">
+            <div class="section-title">Exam Mode Timer</div>
+            <div id="examTimerStatus" class="timer-status status-inactive">
+                ⭕ Exam Timer is INACTIVE
+            </div>
+            <div class="button-group">
+                <button class="btn-primary" onclick="startExamTimer()">Timer ON</button>
+                <button class="btn-danger" onclick="stopExamTimer()">Timer OFF</button>
             </div>
         </div>
         
@@ -991,16 +1437,77 @@ String getHTMLContent() {
         const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
         const fullDayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
         
-        // helper: automatically move focus when field length reached
+        let currentMode = 'normal'; // 'normal' or 'exam'
+        
+        // Toggle between normal and exam mode
+        function toggleExamMode() {
+            const toggle = document.getElementById('examModeToggle');
+            const newMode = toggle.checked ? 'exam' : 'normal';
+            
+            fetch('/api/setexammode?mode=' + (newMode === 'exam' ? 'true' : 'false'))
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        currentMode = newMode;
+                        updateUIForMode(newMode);
+                        showSuccess('✓ Switched to ' + (newMode === 'exam' ? 'EXAM' : 'NORMAL') + ' mode');
+                    } else {
+                        showError('✗ Failed to switch mode: ' + (data.message || 'Unknown error'));
+                        toggle.checked = !toggle.checked;
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                    toggle.checked = !toggle.checked;
+                });
+        }
+        
+        // Update UI visibility based on mode
+        function updateUIForMode(mode) {
+            const normalSections = document.querySelectorAll('.normal-mode-section');
+            const examSections = document.querySelectorAll('.exam-mode-section');
+            
+            if (mode === 'exam') {
+                normalSections.forEach(el => el.classList.add('hidden'));
+                examSections.forEach(el => el.classList.add('visible'));
+                // Load exam periods when switching to exam mode
+                setTimeout(loadExamPeriods, 300);
+            } else {
+                normalSections.forEach(el => el.classList.remove('hidden'));
+                examSections.forEach(el => el.classList.remove('visible'));
+                // Load normal mode data when switching back
+                setTimeout(() => {
+                    loadPeriods();
+                    loadHolidays();
+                }, 300);
+            }
+        }
+        
+        // helper: keep numeric inputs within max digits and optionally auto-advance
+        function clampDigits(el, maxLen) {
+            if (!el) return;
+            let v = (el.value || '').replace(/\D/g, '');
+            if (maxLen && v.length > maxLen) v = v.slice(0, maxLen);
+            if (el.value !== v) el.value = v;
+        }
+
         function setupAutoAdvance(srcId, maxLen, nextId) {
             const el = document.getElementById(srcId);
             if (!el) return;
             el.addEventListener('input', () => {
+                clampDigits(el, maxLen);
                 if (el.value.length >= maxLen && nextId) {
                     const nxt = document.getElementById(nextId);
                     if (nxt) nxt.focus();
                 }
             });
+        }
+
+        function setupMaxLen(srcId, maxLen) {
+            const el = document.getElementById(srcId);
+            if (!el) return;
+            el.addEventListener('input', () => clampDigits(el, maxLen));
         }
 
         // configure auto-advance for time-setting fields
@@ -1016,6 +1523,18 @@ String getHTMLContent() {
             setupAutoAdvance('periodMinute', 2, 'periodSecond');
             setupAutoAdvance('periodSecond', 2, 'periodDelay');
             setupAutoAdvance('periodDelay', 2, null);
+            
+            setupAutoAdvance('examPeriodHour', 2, 'examPeriodMinute');
+            setupAutoAdvance('examPeriodMinute', 2, 'examPeriodSecond');
+            setupAutoAdvance('examPeriodSecond', 2, 'examPeriodDelay');
+            setupAutoAdvance('examPeriodDelay', 2, null);
+
+            setupAutoAdvance('holidayYear', 4, 'holidayMonth');
+            setupAutoAdvance('holidayMonth', 2, 'holidayDay');
+            setupAutoAdvance('holidayDay', 2, null);
+
+            // fields without auto-advance but still need digit limits
+            setupMaxLen('manualDelay', 2);
         });
 
         // Update current time every second
@@ -1053,6 +1572,128 @@ String getHTMLContent() {
                     updateTimerStatus(data.timerActive);
                 })
                 .catch(err => console.error('Error loading periods:', err));
+        }
+
+        function formatHolidayDate(h) {
+            return String(h.year).padStart(4, '0') + '-' +
+                   String(h.month).padStart(2, '0') + '-' +
+                   String(h.day).padStart(2, '0');
+        }
+
+        function loadHolidays() {
+            fetch('/api/holidays')
+                .then(response => response.json())
+                .then(data => {
+                    const holidays = (data.holidays || []).slice().sort((a, b) => {
+                        if (a.year !== b.year) return a.year - b.year;
+                        if (a.month !== b.month) return a.month - b.month;
+                        return a.day - b.day;
+                    });
+                    updateHolidaysList(holidays, !!data.holidayToday, data.maxDates || 15);
+                })
+                .catch(err => console.error('Error loading holidays:', err));
+        }
+
+        function updateHolidaysList(holidays, holidayToday, maxDates) {
+            const listDiv = document.getElementById('holidaysList');
+            const badge = document.getElementById('holidayTodayBadge');
+            if (badge) {
+                badge.style.color = holidayToday ? '#d32f2f' : '#2e7d32';
+                badge.innerText = holidayToday
+                    ? 'Holiday active today: timers are suppressed'
+                    : 'No holiday today';
+            }
+
+            if (!listDiv) return;
+            if (!holidays.length) {
+                listDiv.innerHTML = '<div class="status-label">No holidays added yet.</div>';
+                return;
+            }
+
+            let html = '<div class="status-label" style="margin-bottom: 10px; font-weight: bold;">Holiday Dates (' + holidays.length + '/' + maxDates + '):</div>';
+            holidays.forEach((h) => {
+                html += '<div style="margin: 8px 0; padding: 8px; background: white; border: 1px solid #ddd; border-radius: 5px; display: flex; justify-content: space-between; align-items: center;">';
+                html += '<span style="font-size:16px; font-weight:600;">' + formatHolidayDate(h) + '</span>';
+                html += '<button onclick="deleteHoliday(' + h.index + ')" class="delete-btn">Delete</button>';
+                html += '</div>';
+            });
+            listDiv.innerHTML = html;
+        }
+        
+        function addHoliday() {
+            const year = parseInt(document.getElementById('holidayYear').value) || 0;
+            const month = parseInt(document.getElementById('holidayMonth').value) || 0;
+            const day = parseInt(document.getElementById('holidayDay').value) || 0;
+
+            if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+                showError('Invalid holiday date');
+                return;
+            }
+
+            showInfo('Adding holiday date...');
+            fetch('/api/addholiday?year=' + year + '&month=' + month + '&day=' + day)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showSuccess('[OK] Holiday date added');
+                        document.getElementById('holidayYear').value = '';
+                        document.getElementById('holidayMonth').value = '';
+                        document.getElementById('holidayDay').value = '';
+                        loadHolidays();
+                    } else {
+                        showError('[ERR] Failed to add holiday: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                })
+                .finally(() => {
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.style.opacity = 1;
+                        btn.style.cursor = 'pointer';
+                    }
+                    // Re-apply day enable/disable in case UI state changed.
+                    document.getElementById('periodMode').dispatchEvent(new Event('change'));
+                });
+        }
+
+        function deleteHoliday(index) {
+            if (!confirm('Delete this holiday date?')) return;
+            fetch('/api/deleteholiday?index=' + index)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showSuccess('[OK] Holiday date deleted');
+                        loadHolidays();
+                    } else {
+                        showError('[ERR] Failed to delete holiday');
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                });
+        }
+
+        function clearAllHolidays() {
+            if (!confirm('Delete ALL holiday dates? This cannot be undone.')) return;
+            showInfo('Clearing all holidays...');
+            fetch('/api/clearholidays')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showSuccess('[OK] All holiday dates cleared');
+                        loadHolidays();
+                    } else {
+                        showError('[ERR] Failed to clear holidays: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                });
         }
         
         // Set date & time on RTC
@@ -1108,6 +1749,8 @@ String getHTMLContent() {
         
         // Add time period
         function addPeriod() {
+            const btn = document.getElementById('addPeriodBtn');
+            if (btn && btn.disabled) return; // guard against double-tap/double-click
             const mode = document.getElementById('periodMode').value;
             const hour = parseInt(document.getElementById('periodHour').value) || 0;
             const minute = parseInt(document.getElementById('periodMinute').value) || 0;
@@ -1125,7 +1768,7 @@ String getHTMLContent() {
             let url = '/api/addperiod?hour=' + hour + '&minute=' + minute + '&second=' + second + '&delaySeconds=' + delaySeconds;
             if (mode === 'single') {
                 // convert UI day (1‑7) to internal 0‑6
-            let day = parseInt(document.getElementById('periodDay').value);
+            const day = parseInt(document.getElementById('periodDay').value);
             if (isNaN(day) || day < 1 || day > 7) {
                 showError('Invalid day selected');
                 return;
@@ -1135,19 +1778,23 @@ String getHTMLContent() {
                 url += '&group=' + mode; // server will replicate days
             }
 
+            if (btn) {
+                btn.disabled = true;
+                btn.style.opacity = 0.7;
+                btn.style.cursor = 'not-allowed';
+            }
+
             fetch(url)
               .then(response => response.json())
               .then(data => {
                 if (data.success) {
-                  showSuccess('✓ Period(s) added successfully!');
+                  showSuccess('✓ ' + (data.message || 'Period(s) added successfully!'));
+                  loadPeriods(); // Refresh the list
                   // Clear inputs
                   document.getElementById('periodHour').value = '';
                   document.getElementById('periodMinute').value = '';
                   document.getElementById('periodSecond').value = '';
-                  document.getElementById('periodDelay').value = '0';
-                  document.getElementById('periodMode').value = 'single';
-                  document.getElementById('periodDay').disabled = false;
-                  loadPeriods(); // Refresh the list
+                  document.getElementById('periodDelay').value = '';
                 } else {
                   // show inline error
                   showError('✗ Failed to add period: ' + (data.message || 'Unknown error'));
@@ -1160,6 +1807,14 @@ String getHTMLContent() {
                 .catch(err => {
                     console.error('Error:', err);
                     showError('Connection error!');
+                })
+                .finally(() => {
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.style.opacity = 1;
+                        btn.style.cursor = 'pointer';
+                    }
+                    document.getElementById('periodMode').dispatchEvent(new Event('change'));
                 });
         }
         
@@ -1169,7 +1824,9 @@ String getHTMLContent() {
             const dayStr = days.join(',');
             
             // Check for known patterns
-            if (dayStr === '1,2,3,4,5') return 'Mon-Friday';
+            if (dayStr === '1,2,3,4,5,6') return 'Mon-Sat';
+            if (dayStr === '1,2,3,4,5') return 'Mon-Fri';
+            if (dayStr === '1,2,3,4') return 'Mon-Thu';
             if (dayStr === '6') return 'Saturday';
             if (dayStr === '0,1,2,3,4,5,6') return 'Every Day';
             if (dayStr === '0') return 'Sunday';
@@ -1204,7 +1861,8 @@ String getHTMLContent() {
                 }
                 
                 groups[key].periods.push(period);
-                groups[key].indices.push(idx);
+                // use server-provided index if available (this is the 'orig' field from API)
+                groups[key].indices.push(typeof period.index === 'number' ? period.index : idx);
                 processed.add(idx);
             });
             
@@ -1533,6 +2191,269 @@ String getHTMLContent() {
                 });
         }
         
+        // ===== EXAM MODE FUNCTIONS =====
+        
+        // Load exam periods
+        function loadExamPeriods() {
+            fetch('/api/examperiods')
+                .then(response => response.json())
+                .then(data => {
+                    // server already sorts but do a safe client-side sort as well
+                    data.periods.sort((a,b) => {
+                        // choose comparison key as dayStart for groups or day otherwise
+                        const da = (a.isGroup ? a.dayStart : a.day);
+                        const db = (b.isGroup ? b.dayStart : b.day);
+                        if (da !== db) return da - db;
+                        if (a.hour !== b.hour) return a.hour - b.hour;
+                        if (a.minute !== b.minute) return a.minute - b.minute;
+                        return a.second - b.second;
+                    });
+                    updateExamPeriodsList(data.periods);
+                    updateExamTimerStatus(data.timerActive);
+                })
+                .catch(err => console.error('Error loading exam periods:', err));
+        }
+        
+        // Add exam period (only Mon-Fri or Mon-Sat)
+        function addExamPeriod() {
+            const mode = document.getElementById('examPeriodMode').value;
+            const hour = parseInt(document.getElementById('examPeriodHour').value) || 0;
+            const minute = parseInt(document.getElementById('examPeriodMinute').value) || 0;
+            const second = parseInt(document.getElementById('examPeriodSecond').value) || 0;
+            const delaySeconds = parseInt(document.getElementById('examPeriodDelay').value) || 0;
+            
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 || delaySeconds < 0 || delaySeconds > 60) {
+                showError('Invalid period format! Delay must be 0-60 seconds');
+                return;
+            }
+            
+            showInfo('Adding exam schedule...');
+            
+            let url = '/api/addexamperiod?hour=' + hour + '&minute=' + minute + '&second=' + second + '&delaySeconds=' + delaySeconds;
+            let lastPeriodMode = document.getElementById("examPeriodMode").value;
+            if (mode === 'weekdays') {
+                url += '&group=weekdays'; // Mon-Fri
+            } else if (mode === 'monfri') {
+                url += '&group=monfri';   // Mon-Sat
+            }
+
+            fetch(url)
+              .then(response => response.json())
+              .then(data => {
+                if (data.success) {
+                  showSuccess('✓ Exam schedule added successfully!');
+                  loadExamPeriods(); // Refresh the list
+                  // Clear inputsloadExamPeriods(); // Refresh the list
+                  document.getElementById('examPeriodHour').value = '';
+                  document.getElementById('examPeriodMinute').value = '';
+                  document.getElementById('examPeriodSecond').value = '';
+                  document.getElementById('examPeriodDelay').value = '';
+                  document.getElementById('examPeriodMode').value = lastPeriodMode;
+                } else {
+                  showError('✗ Failed to add exam schedule: ' + (data.message || 'Unknown error'));
+                }
+              })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                });
+        }
+        
+        // Update exam periods list display using normal-mode grouping
+        function updateExamPeriodsList(periods) {
+            const listDiv = document.getElementById('examPeriodsList');
+            if (periods.length === 0) {
+                listDiv.innerHTML = '<div class="status-label">No exam schedules added yet.</div>';
+                return;
+            }
+            
+            const groups = groupPeriods(periods);
+            let html = '<div class="status-label" style="margin-bottom: 10px; font-weight: bold;">Exam Schedules ({0}):</div>'.replace('{0}', groups.length);
+            groups.forEach((group) => {
+                const timeStr = String(group.time.hour).padStart(2, '0') + ':' + 
+                               String(group.time.minute).padStart(2, '0') + ':' + 
+                               String(group.time.second).padStart(2, '0');
+                const delayMinSec = Math.floor(group.delay / 60) + 'm ' + (group.delay % 60) + 's';
+                const days = group.periods.map(p => p.day);
+                const groupLabel = detectGroupType(days);
+                
+                html += '<div style="margin: 8px 0; padding: 8px; background: white; border: 1px solid #ddd; border-radius: 5px; display: flex; justify-content: space-between; align-items: center;">';
+                html += '<span><strong>' + groupLabel + '</strong> at ' + timeStr + ' → Duration: ' + delayMinSec + '</span>';
+                const indicesStr = JSON.stringify(group.indices);
+                html += '<button onclick="editGroupExamPeriod(\'' + indicesStr.replace(/'/g, "\\'") + '\')" style="background: #4caf50; color: white; border: none; border-radius: 3px; padding: 5px 10px; cursor: pointer; font-size: 12px; margin-right:5px;">Edit</button>';
+                html += '<button onclick="deleteGroupExamPeriod(\'' + indicesStr.replace(/'/g, "\\'") + '\')" style="background: #ff6b6b; color: white; border: none; border-radius: 3px; padding: 5px 10px; cursor: pointer; font-size: 12px;">Delete</button>';
+                html += '</div>';
+            });
+            listDiv.innerHTML = html;
+        }
+        
+        // Delete a single exam period by index
+        function deleteExamPeriod(index) {
+            if (confirm('Delete this exam schedule?')) {
+                fetch('/api/deleteexamperiod?index=' + index)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            showSuccess('✓ Exam schedule deleted!');
+                            loadExamPeriods();
+                        } else {
+                            showError('✗ Failed to delete exam schedule');
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Error:', err);
+                        showError('Connection error!');
+                    });
+            }
+        }
+        
+        // Edit grouped exam periods (apply changes to entire range in one request)
+        function editGroupExamPeriod(indicesJson) {
+            const indices = JSON.parse(indicesJson);
+            fetch('/api/examperiods')
+                .then(resp => resp.json())
+                .then(data => {
+                    // pick base period from first index
+                    const basePeriod = data.periods.find(p => p.index === indices[0]);
+                    if (!basePeriod) return;
+                    // determine day range from all indices
+                    const days = indices.map(i => {
+                        const p = data.periods.find(x => x.index === i);
+                        return p ? p.day : basePeriod.day;
+                    }).sort((a,b)=>a-b);
+                    const dayStart = days[0];
+                    const dayEnd = days[days.length-1];
+
+                    let newHour = prompt('Hour (0-23):', basePeriod.hour);
+                    if (newHour === null) return;
+                    newHour = parseInt(newHour);
+                    let newMinute = prompt('Minute (0-59):', basePeriod.minute);
+                    if (newMinute === null) return;
+                    newMinute = parseInt(newMinute);
+                    let newSecond = prompt('Second (0-59):', basePeriod.second);
+                    if (newSecond === null) return;
+                    newSecond = parseInt(newSecond);
+                    let newDelay = prompt('Delay seconds:', basePeriod.delaySeconds);
+                    if (newDelay === null) return;
+                    newDelay = parseInt(newDelay);
+                    if (isNaN(newHour) || newHour < 0 || newHour > 23 ||
+                        isNaN(newMinute) || newMinute < 0 || newMinute > 59 ||
+                        isNaN(newSecond) || newSecond < 0 || newSecond > 59 ||
+                        isNaN(newDelay) || newDelay < 0 || newDelay > 60) {
+                        showError('Invalid values entered, edit cancelled');
+                        return;
+                    }
+
+                    let url = '/api/editexamperiod?index=' + indices[0] +
+                              '&dayStart=' + (dayStart + 1) +
+                              '&dayEnd=' + (dayEnd + 1) +
+                              '&hour=' + newHour + '&minute=' + newMinute +
+                              '&second=' + newSecond + '&delaySeconds=' + newDelay;
+                    fetch(url)
+                        .then(resp => resp.json())
+                        .then(d => {
+                            if (d.success) showSuccess('✓ Exam schedule updated');
+                            else showError('✗ Failed to update exam schedule: ' + (d.message || 'Unknown error'));
+                            loadExamPeriods();
+                        })
+                        .catch(err => { console.error('Error:', err); showError('Connection error!'); });
+                })
+                .catch(err => { console.error('Error fetching periods:', err); });
+        }
+
+        // Delete grouped exam periods (indices JSON string)
+        function deleteGroupExamPeriod(indicesJson) {
+            let indices = JSON.parse(indicesJson);
+            // sort descending so removals don't shift remaining indexes
+            indices.sort((a,b) => b - a);
+            if (!confirm('Delete this exam schedule?')) return;
+            let done = 0;
+            const delNext = () => {
+                if (done >= indices.length) {
+                    showSuccess('✓ Exam schedule deleted');
+                    loadExamPeriods();
+                    return;
+                }
+                fetch('/api/deleteexamperiod?index=' + indices[done++])
+                    .then(resp => resp.json())
+                    .then(d => delNext())
+                    .catch(err => { console.error('Error:', err); showError('Connection error!'); });
+            };
+            delNext();
+        }
+
+        // Clear all exam periods
+        function clearAllExamPeriods() {
+          if (!confirm('Delete ALL exam schedules? This cannot be undone.')) return;
+          showInfo('Clearing all exam schedules...');
+          fetch('/api/clearexamperiods')
+            .then(response => response.json())
+            .then(data => {
+              if (data.success) {
+                showSuccess('✓ All exam schedules cleared');
+                loadExamPeriods();
+              } else {
+                showError('✗ Failed to clear exam schedules: ' + (data.message || 'Unknown error'));
+              }
+            })
+            .catch(err => {
+              console.error('Error:', err);
+              showError('Connection error!');
+            });
+        }
+        
+        // Start exam timer
+        function startExamTimer() {
+            showInfo('Starting exam timer...');
+            
+            fetch('/api/startexamtimer')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showSuccess('✓ Exam timer started!');
+                        updateExamTimerStatus(true);
+                    } else {
+                        showError('✗ Failed to start exam timer');
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                });
+        }
+        
+        // Stop exam timer
+        function stopExamTimer() {
+            fetch('/api/stopexamtimer')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showSuccess('✓ Exam timer stopped!');
+                        updateExamTimerStatus(false);
+                    } else {
+                        showError('✗ Failed to stop exam timer');
+                    }
+                })
+                .catch(err => {
+                    console.error('Error:', err);
+                    showError('Connection error!');
+                });
+        }
+        
+        // Update exam timer status display
+        function updateExamTimerStatus(isActive) {
+            const statusDiv = document.getElementById('examTimerStatus');
+            if (statusDiv) {
+                if (isActive) {
+                    statusDiv.className = 'timer-status status-active';
+                    statusDiv.innerHTML = '<span class="loading"></span>Exam Timer is ACTIVE';
+                } else {
+                    statusDiv.className = 'timer-status status-inactive';
+                    statusDiv.innerHTML = '⭕ Exam Timer is INACTIVE';
+                }
+            }
+        }
+        
         // Update timer status display
         function updateTimerStatus(isActive) {
             const statusDiv = document.getElementById('timerStatus');
@@ -1573,12 +2494,14 @@ String getHTMLContent() {
         window.addEventListener('DOMContentLoaded', function() {
             updateCurrentTime();
             loadPeriods();
+            loadHolidays();
             
             // make sure the day dropdown state matches the default mode
             document.getElementById('periodMode').dispatchEvent(new Event('change'));            
 
             // Update time every second
             setInterval(updateCurrentTime, 1000);
+            setInterval(loadHolidays, 60000);
             
             // Refresh timer status every 2 seconds
             setInterval(() => {
@@ -1604,6 +2527,7 @@ String getHTMLContent() {
 </body>
 </html>
 )rawliteral";
+  return html;
 }
 
 void handleGetTime() {
@@ -1708,6 +2632,29 @@ void handleGetPeriods() {
   server.send(200, "application/json", json);
 }
 
+void handleGetHolidays() {
+  String json = "{";
+  json += "\"maxDates\":" + String(HOLIDAY_MAX_DATES) + ",";
+  json += "\"holidays\":[";
+  for (int i = 0; i < holidayData.numDates; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"year\":" + String(holidayData.dates[i].year) + ",";
+    json += "\"month\":" + String(holidayData.dates[i].month) + ",";
+    json += "\"day\":" + String(holidayData.dates[i].day);
+    json += "}";
+  }
+  json += "]";
+  if (rtcAvailable) {
+    json += ",\"holidayToday\":" + String(isHolidayToday(rtc.now()) ? "true" : "false");
+  } else {
+    json += ",\"holidayToday\":false";
+  }
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void handleAddPeriod() {
   // hour/minute/second/delay are required, plus either a day or a group flag
   if (server.hasArg("hour") && server.hasArg("minute") && server.hasArg("second") && server.hasArg("delaySeconds") &&
@@ -1732,6 +2679,8 @@ void handleAddPeriod() {
       String grp = server.arg("group");
       if (grp == "weekdays") {
         for (uint8_t d = 1; d <= 5; d++) daysArr[dayCount++] = d;
+      } else if (grp == "mon_to_thu") {
+        for (uint8_t d = 1; d <= 4; d++) daysArr[dayCount++] = d;
       } else if (grp == "saturday") {
         daysArr[dayCount++] = 6;
       } else if (grp == "everyday") {
@@ -1751,30 +2700,92 @@ void handleAddPeriod() {
       return;
     }
 
-    if (timerData.numPeriods + dayCount > MAX_PERIODS) {
-      String response = "{\"success\":false,\"message\":\"Not enough space for all selected days (limit " + String(MAX_PERIODS) + ")\"}";
+    // Count actual additions after de-duplication (prevents accidental repeats).
+    int wouldAdd = 0;
+    for (int i = 0; i < dayCount; i++) {
+      Period candidate;
+      candidate.day = daysArr[i];
+      candidate.hour = (uint8_t)hour;
+      candidate.minute = (uint8_t)minute;
+      candidate.second = (uint8_t)second;
+      candidate.delaySeconds = (uint16_t)delay;
+      if (!hasDuplicateInTimerData(candidate, timerData.numPeriods)) wouldAdd++;
+    }
+
+    if (wouldAdd <= 0) {
+      server.send(200, "application/json", "{\"success\":true,\"added\":0,\"skipped\":1,\"message\":\"Already exists\"}");
+      return;
+    }
+
+    if ((int)timerData.numPeriods + wouldAdd > MAX_PERIODS) {
+      String response = "{\"success\":false,\"message\":\"Not enough space for selected days (limit " + String(MAX_PERIODS) + ")\"}";
       server.send(400, "application/json", response);
       return;
     }
 
+    int added = 0;
+    int skipped = 0;
     for (int i = 0; i < dayCount; i++) {
       Period newPeriod;
       newPeriod.day = daysArr[i];
-      newPeriod.hour = hour;
-      newPeriod.minute = minute;
-      newPeriod.second = second;
-      newPeriod.delaySeconds = delay;
+      newPeriod.hour = (uint8_t)hour;
+      newPeriod.minute = (uint8_t)minute;
+      newPeriod.second = (uint8_t)second;
+      newPeriod.delaySeconds = (uint16_t)delay;
+
+      if (hasDuplicateInTimerData(newPeriod, timerData.numPeriods)) {
+        skipped++;
+        continue;
+      }
       timerData.periods[timerData.numPeriods++] = newPeriod;
+      added++;
     }
 
-    saveDataToEEPROM();
+    saveDataToPreferences();
 
-    String response = "{\"success\":true}";
+    String response = "{\"success\":true,\"added\":" + String(added) + ",\"skipped\":" + String(skipped) + ",\"message\":\"Added " + String(added) + " period(s)\"}";
     server.send(200, "application/json", response);
   } else {
     String response = "{\"success\":false,\"message\":\"Missing parameters\"}";
     server.send(400, "application/json", response);
   }
+}
+
+void handleAddHoliday() {
+  if (!(server.hasArg("year") && server.hasArg("month") && server.hasArg("day"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Missing parameters\"}");
+    return;
+  }
+
+  int year = server.arg("year").toInt();
+  int month = server.arg("month").toInt();
+  int day = server.arg("day").toInt();
+
+  if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid date\"}");
+    return;
+  }
+
+  for (int i = 0; i < holidayData.numDates; i++) {
+    const HolidayDate &h = holidayData.dates[i];
+    if (h.year == year && h.month == month && h.day == day) {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"Date already exists\"}");
+      return;
+    }
+  }
+
+  if (holidayData.numDates >= HOLIDAY_MAX_DATES) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Holiday limit reached (15)\"}");
+    return;
+  }
+
+  HolidayDate hd;
+  hd.year = (uint16_t)year;
+  hd.month = (uint8_t)month;
+  hd.day = (uint8_t)day;
+  holidayData.dates[holidayData.numDates++] = hd;
+  saveDataToPreferences();
+  server.send(200, "application/json", "{\"success\":true}");
 }
 
 void handleDeletePeriod() {
@@ -1785,7 +2796,7 @@ void handleDeletePeriod() {
         timerData.periods[i] = timerData.periods[i + 1];
       }
       timerData.numPeriods--;
-      saveDataToEEPROM();
+      saveDataToPreferences();
       String response = "{\"success\":true}";
       server.send(200, "application/json", response);
     } else {
@@ -1798,28 +2809,41 @@ void handleDeletePeriod() {
   }
 }
 
+void handleDeleteHoliday() {
+  if (!server.hasArg("index")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Missing index\"}");
+    return;
+  }
+
+  int index = server.arg("index").toInt();
+  if (index < 0 || index >= holidayData.numDates) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid index\"}");
+    return;
+  }
+
+  for (int i = index; i < holidayData.numDates - 1; i++) {
+    holidayData.dates[i] = holidayData.dates[i + 1];
+  }
+  holidayData.numDates--;
+  saveDataToPreferences();
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
 // clear all scheduled periods
 void handleClearPeriods() {
   // reset in-memory
   timerData.numPeriods = 0;
   timerData.timerActive = false;
-
-  // clear EEPROM area used for periods to avoid stale data
-  for (int i = 0; i < MAX_PERIODS; i++) {
-    int addr = 2 + i * 6;
-    EEPROM.write(addr, 0);
-    EEPROM.write(addr + 1, 0);
-    EEPROM.write(addr + 2, 0);
-    EEPROM.write(addr + 3, 0);
-    EEPROM.write(addr + 4, 0);
-    EEPROM.write(addr + 5, 0);
-  }
-
-  // save header and magic
-  saveDataToEEPROM();
+  saveDataToPreferences();
 
   String response = "{\"success\":true}";
   server.send(200, "application/json", response);
+}
+
+void handleClearHolidays() {
+  holidayData.numDates = 0;
+  saveDataToPreferences();
+  server.send(200, "application/json", "{\"success\":true}");
 }
 
 // handle editing an existing period
@@ -1845,7 +2869,7 @@ void handleEditPeriod() {
       timerData.periods[index].minute = minute;
       timerData.periods[index].second = second;
       timerData.periods[index].delaySeconds = delay;
-      saveDataToEEPROM();
+      saveDataToPreferences();
       String response = "{\"success\":true}";
       server.send(200, "application/json", response);
     } else {
@@ -1879,7 +2903,7 @@ void handleTrigger() {
 
 void handleStartTimer() {
   timerData.timerActive = true;
-  saveDataToEEPROM();
+  saveDataToPreferences();
   
   ////Serial.print.println("Timer started");
   String response = "{\"success\":true}";
@@ -1893,9 +2917,388 @@ void handleStopTimer() {
   digitalWrite(TIMER_OUTPUT_PIN, LOW);
   relayState.isActive = false;
   
-  saveDataToEEPROM();
+  saveDataToPreferences();
   
   ////Serial.print.println("Timer stopped");
+  String response = "{\"success\":true}";
+  server.send(200, "application/json", response);
+}
+
+// ==================== EXAM MODE HANDLERS ====================
+
+void handleSetExamMode() {
+  if (server.hasArg("mode")) {
+    String modeStr = server.arg("mode");
+    bool newExamMode = (modeStr == "true") || (modeStr == "1");
+    
+    // When switching to exam mode, stop normal timer
+    if (newExamMode && timerData.timerActive) {
+      timerData.timerActive = false;
+      digitalWrite(TIMER_OUTPUT_PIN, LOW);
+      relayState.isActive = false;
+    }
+    
+    // When switching to normal mode, stop exam timer
+    if (!newExamMode && examData.timerActive) {
+      examData.timerActive = false;
+      digitalWrite(TIMER_OUTPUT_PIN, LOW);
+      relayState.isActive = false;
+    }
+    
+    examModeEnabled = newExamMode;
+    saveDataToPreferences();
+    
+    String response = "{\"success\":true}";
+    server.send(200, "application/json", response);
+  } else {
+    String response = "{\"success\":false,\"message\":\"Missing mode parameter\"}";
+    server.send(400, "application/json", response);
+  }
+}
+
+void handleGetExamPeriods() {
+  // return a sorted copy of the exam periods along with their original indices
+  struct Indexed { Period p; int orig; } arr[MAX_PERIODS];
+  int count = examData.numPeriods;
+
+  // copy with index
+  for (int i = 0; i < count; i++) {
+    arr[i].p = examData.periods[i];
+    arr[i].orig = i;
+  }
+  // bubble sort by day/time
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      Period &a = arr[i].p;
+      Period &b = arr[j].p;
+      bool swap = false;
+      if (b.day < a.day) swap = true;
+      else if (b.day == a.day) {
+        if (b.hour < a.hour) swap = true;
+        else if (b.hour == a.hour) {
+          if (b.minute < a.minute) swap = true;
+          else if (b.minute == a.minute && b.second < a.second) swap = true;
+        }
+      }
+      if (swap) {
+        Indexed tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+    }
+  }
+
+  String json = "{";
+  json += "\"periods\": [";
+  for (int i = 0; i < count; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"index\":" + String(arr[i].orig) + ",";
+    json += "\"day\":" + String(arr[i].p.day) + ",";
+    json += "\"hour\":" + String(arr[i].p.hour) + ",";
+    json += "\"minute\":" + String(arr[i].p.minute) + ",";
+    json += "\"second\":" + String(arr[i].p.second) + ",";
+    json += "\"delaySeconds\":" + String(arr[i].p.delaySeconds);
+    json += "}";
+  }
+  json += "],";
+  json += "\"timerActive\":" + String(examData.timerActive ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleAddExamPeriod() {
+  // Similar to normal period, but only supports weekdays and saturday (1-5 and 1-6)
+  if (server.hasArg("hour") && server.hasArg("minute") && server.hasArg("second") && server.hasArg("delaySeconds") &&
+      server.hasArg("group")) {
+    int hour = server.arg("hour").toInt();
+    int minute = server.arg("minute").toInt();
+    int second = server.arg("second").toInt();
+    int delay = server.arg("delaySeconds").toInt();
+
+    if (!isValidTime(hour, minute, second) || !isValidDelay(delay)) {
+      String response = "{\"success\":false,\"message\":\"Invalid time/delay values\"}";
+      server.send(400, "application/json", response);
+      return;
+    }
+
+    uint8_t daysArr[7];
+    int dayCount = 0;
+    String grp = server.arg("group");
+
+    if (grp == "weekdays") {
+      // Monday to Friday (1-5)
+      for (uint8_t d = 1; d <= 5; d++) daysArr[dayCount++] = d;
+    } else if (grp == "monfri") {
+      // Monday to Saturday (1-6)
+      for (uint8_t d = 1; d <= 6; d++) daysArr[dayCount++] = d;
+    } else {
+      String response = "{\"success\":false,\"message\":\"Invalid group for exam mode\"}";
+      server.send(400, "application/json", response);
+      return;
+    }
+
+    if (examData.numPeriods + dayCount > EXAM_MAX_PERIODS) {
+      String response = "{\"success\":false,\"message\":\"Not enough space for all selected days (limit " + String(EXAM_MAX_PERIODS) + ")\"}";
+      server.send(400, "application/json", response);
+      return;
+    }
+
+    for (int i = 0; i < dayCount; i++) {
+      Period newPeriod;
+      newPeriod.day = daysArr[i];
+      newPeriod.hour = hour;
+      newPeriod.minute = minute;
+      newPeriod.second = second;
+      newPeriod.delaySeconds = delay;
+      examData.periods[examData.numPeriods++] = newPeriod;
+    }
+
+    saveDataToPreferences();
+
+    String response = "{\"success\":true}";
+    server.send(200, "application/json", response);
+  } else {
+    String response = "{\"success\":false,\"message\":\"Missing parameters\"}";
+    server.send(400, "application/json", response);
+  }
+}
+
+void handleDeleteExamPeriod() {
+  if (server.hasArg("index")) {
+    int index = server.arg("index").toInt();
+    if (index >= 0 && index < examData.numPeriods) {
+      // Determine if caller wants to delete a group range
+      if (server.hasArg("dayStart") && server.hasArg("dayEnd")) {
+        int ds = normalizeDay(server.arg("dayStart").toInt());
+        int de = normalizeDay(server.arg("dayEnd").toInt());
+        if (ds < 0 || de < 0 || de < ds) {
+          String response = "{\"success\":false,\"message\":\"Invalid day range\"}";
+          server.send(400, "application/json", response);
+          return;
+        }
+        // remove all periods that fall within [ds,de] and match the time/delay of the indexed period
+        Period base = examData.periods[index];
+        Period tmp[MAX_PERIODS];
+        int newCount = 0;
+        for (int i = 0; i < examData.numPeriods; i++) {
+          Period &p = examData.periods[i];
+          if (p.day >= ds && p.day <= de && p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+            // skip (delete)
+            continue;
+          }
+          tmp[newCount++] = p;
+        }
+        // copy back
+        for (int i = 0; i < newCount; i++) examData.periods[i] = tmp[i];
+        examData.numPeriods = newCount;
+        saveDataToPreferences();
+        String response = "{\"success\":true}";
+        server.send(200, "application/json", response);
+        return;
+      }
+
+      // No explicit range provided — attempt to detect contiguous group with identical time/delay
+      Period base = examData.periods[index];
+      bool present[7] = {false,false,false,false,false,false,false};
+      for (int i = 0; i < examData.numPeriods; i++) {
+        Period &p = examData.periods[i];
+        if (p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+          if (p.day >=0 && p.day <=6) present[p.day] = true;
+        }
+      }
+      // find consecutive range containing base.day
+      int start = base.day, end = base.day;
+      while (start > 0 && present[start-1]) start--;
+      while (end < 6 && present[end+1]) end++;
+      if (end - start >= 1) {
+        // delete all in range [start,end] that match base time/delay
+        Period tmp[MAX_PERIODS];
+        int newCount = 0;
+        for (int i = 0; i < examData.numPeriods; i++) {
+          Period &p = examData.periods[i];
+          if (p.day >= start && p.day <= end && p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+            continue;
+          }
+          tmp[newCount++] = p;
+        }
+        for (int i = 0; i < newCount; i++) examData.periods[i] = tmp[i];
+        examData.numPeriods = newCount;
+        saveDataToPreferences();
+        String response = "{\"success\":true}";
+        server.send(200, "application/json", response);
+        return;
+      }
+
+      // Otherwise delete single index entry (shift down)
+      for (int i = index; i < examData.numPeriods - 1; i++) {
+        examData.periods[i] = examData.periods[i + 1];
+      }
+      examData.numPeriods--;
+      saveDataToPreferences();
+      String response = "{\"success\":true}";
+      server.send(200, "application/json", response);
+    } else {
+      String response = "{\"success\":false,\"message\":\"Invalid index\"}";
+      server.send(400, "application/json", response);
+    }
+  } else {
+    String response = "{\"success\":false,\"message\":\"Missing index\"}";
+    server.send(400, "application/json", response);
+  }
+}
+
+void handleClearExamPeriods() {
+  examData.numPeriods = 0;
+  examData.timerActive = false;
+
+  // clear in-memory slots and EEPROM area used for exam periods
+  for (int i = 0; i < EXAM_MAX_PERIODS; i++) {
+    examData.periods[i].day = 0;
+    examData.periods[i].hour = 0;
+    examData.periods[i].minute = 0;
+    examData.periods[i].second = 0;
+    examData.periods[i].delaySeconds = 0;
+  }
+  saveDataToPreferences();
+
+  String response = "{\"success\":true}";
+  server.send(200, "application/json", response);
+}
+
+void handleEditExamPeriod() {
+  if (server.hasArg("index") && server.hasArg("hour") &&
+      server.hasArg("minute") && server.hasArg("second") && server.hasArg("delaySeconds")) {
+    int index = server.arg("index").toInt();
+    if (index >= 0 && index < examData.numPeriods) {
+      bool hasDay = server.hasArg("day");
+      bool hasRange = server.hasArg("dayStart") && server.hasArg("dayEnd");
+      int nd = hasDay ? normalizeDay(server.arg("day").toInt()) : -1;
+      int hour = server.arg("hour").toInt();
+      int minute = server.arg("minute").toInt();
+      int second = server.arg("second").toInt();
+      int delay = server.arg("delaySeconds").toInt();
+
+      if ((!hasDay && !hasRange) || (hasDay && nd < 0) ||
+          !isValidTime(hour, minute, second) || !isValidDelay(delay)) {
+        String response = "{\"success\":false,\"message\":\"Invalid parameter values\"}";
+        server.send(400, "application/json", response);
+        return;
+      }
+
+      // If caller provided a day range, apply update to entire range
+      if (hasRange) {
+        int ds = normalizeDay(server.arg("dayStart").toInt());
+        int de = normalizeDay(server.arg("dayEnd").toInt());
+        if (ds < 0 || de < 0 || de < ds) {
+          String response = "{\"success\":false,\"message\":\"Invalid day range\"}";
+          server.send(400, "application/json", response);
+          return;
+        }
+        // Update existing entries within range that match original time/delay; if missing, add new entries
+        Period base = examData.periods[index];
+        bool foundForDay[7] = {false,false,false,false,false,false,false};
+        for (int i = 0; i < examData.numPeriods; i++) {
+          Period &p = examData.periods[i];
+          if (p.day >= ds && p.day <= de && p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+            p.hour = hour;
+            p.minute = minute;
+            p.second = second;
+            p.delaySeconds = delay;
+            foundForDay[p.day] = true;
+          }
+        }
+        // add missing days
+        for (int d = ds; d <= de; d++) {
+          if (!foundForDay[d]) {
+            if (examData.numPeriods < EXAM_MAX_PERIODS) {
+              Period np;
+              np.day = d;
+              np.hour = hour;
+              np.minute = minute;
+              np.second = second;
+              np.delaySeconds = delay;
+              examData.periods[examData.numPeriods++] = np;
+            }
+          }
+        }
+        saveDataToPreferences();
+        String response = "{\"success\":true}";
+        server.send(200, "application/json", response);
+        return;
+      }
+
+      // No explicit range — attempt to detect contiguous group around the index and update them all
+      Period base = examData.periods[index];
+      bool present[7] = {false,false,false,false,false,false,false};
+      for (int i = 0; i < examData.numPeriods; i++) {
+        Period &p = examData.periods[i];
+        if (p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+          if (p.day >=0 && p.day <=6) present[p.day] = true;
+        }
+      }
+      int start = base.day, end = base.day;
+      while (start > 0 && present[start-1]) start--;
+      while (end < 6 && present[end+1]) end++;
+      if (end - start >= 1) {
+        // update all within range
+        for (int i = 0; i < examData.numPeriods; i++) {
+          Period &p = examData.periods[i];
+          if (p.day >= start && p.day <= end && p.hour == base.hour && p.minute == base.minute && p.second == base.second && p.delaySeconds == base.delaySeconds) {
+            p.hour = hour;
+            p.minute = minute;
+            p.second = second;
+            p.delaySeconds = delay;
+          }
+        }
+        saveDataToPreferences();
+        String response = "{\"success\":true}";
+        server.send(200, "application/json", response);
+        return;
+      }
+
+      // single entry update
+      examData.periods[index].day = nd;
+      examData.periods[index].hour = hour;
+      examData.periods[index].minute = minute;
+      examData.periods[index].second = second;
+      examData.periods[index].delaySeconds = delay;
+      saveDataToPreferences();
+      String response = "{\"success\":true}";
+      server.send(200, "application/json", response);
+    } else {
+      String response = "{\"success\":false,\"message\":\"Invalid index\"}";
+      server.send(400, "application/json", response);
+    }
+  } else {
+    String response = "{\"success\":false,\"message\":\"Missing parameters\"}";
+    server.send(400, "application/json", response);
+  }
+}
+
+void handleStartExamTimer() {
+  examData.timerActive = true;
+  
+  // Stop normal timer if active
+  if (timerData.timerActive) {
+    timerData.timerActive = false;
+  }
+  
+  saveDataToPreferences();
+  
+  String response = "{\"success\":true}";
+  server.send(200, "application/json", response);
+}
+
+void handleStopExamTimer() {
+  examData.timerActive = false;
+  
+  // Force relay off immediately
+  digitalWrite(TIMER_OUTPUT_PIN, LOW);
+  relayState.isActive = false;
+  
+  saveDataToPreferences();
+  
   String response = "{\"success\":true}";
   server.send(200, "application/json", response);
 }
@@ -1904,55 +3307,302 @@ void handleNotFound() {
   server.send(404, "text/plain", "Not Found");
 }
 
-// ==================== EEPROM FUNCTIONS ====================
-void saveDataToEEPROM() {
-  EEPROM.write(0, timerData.numPeriods);
-  EEPROM.write(1, timerData.timerActive ? 1 : 0);
+// ==================== PREFERENCES FUNCTIONS ====================
+void saveDataToPreferences() {
+  StoredTimerData storedTimer = {};
+  StoredExamData storedExam = {};
+  StoredHolidayData storedHoliday = {};
 
-  for (int i = 0; i < timerData.numPeriods; i++) {
-    int addr = 2 + i * 6;
-    EEPROM.write(addr, timerData.periods[i].day);
-    EEPROM.write(addr + 1, timerData.periods[i].hour);
-    EEPROM.write(addr + 2, timerData.periods[i].minute);
-    EEPROM.write(addr + 3, timerData.periods[i].second);
-    EEPROM.write(addr + 4, timerData.periods[i].delaySeconds >> 8); // high byte
-    EEPROM.write(addr + 5, timerData.periods[i].delaySeconds & 0xFF); // low byte
+  storedTimer.numPeriods = timerData.numPeriods;
+  storedTimer.timerActive = timerData.timerActive ? 1 : 0;
+  for (int i = 0; i < timerData.numPeriods && i < MAX_PERIODS; i++) {
+    storedTimer.periods[i] = timerData.periods[i];
   }
 
-  // mark EEPROM as initialized
-  EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
-  EEPROM.commit();
-  ////Serial.print.println("Data saved to EEPROM");
+  storedExam.numPeriods = examData.numPeriods;
+  storedExam.timerActive = examData.timerActive ? 1 : 0;
+  for (int i = 0; i < examData.numPeriods && i < EXAM_MAX_PERIODS; i++) {
+    storedExam.periods[i] = examData.periods[i];
+  }
+
+  storedHoliday.numDates = holidayData.numDates;
+  for (int i = 0; i < holidayData.numDates && i < HOLIDAY_MAX_DATES; i++) {
+    storedHoliday.dates[i] = holidayData.dates[i];
+  }
+
+  prefs.putUChar(PREFS_MAGIC_KEY, PREFS_MAGIC_VALUE);
+  prefs.putBytes(PREFS_TIMER_KEY, &storedTimer, sizeof(storedTimer));
+  prefs.putBytes(PREFS_EXAM_KEY, &storedExam, sizeof(storedExam));
+  prefs.putBytes(PREFS_HOLIDAY_KEY, &storedHoliday, sizeof(storedHoliday));
+  prefs.putUChar(PREFS_EXAMEN_KEY, examModeEnabled ? 1 : 0);
+  ////Serial.print.println("Data saved to Preferences");
 }
 
-void loadDataFromEEPROM() {
-  // Check magic byte to determine if EEPROM was initialized by this firmware
-  uint8_t magic = EEPROM.read(EEPROM_MAGIC_ADDR);
-  if (magic != EEPROM_MAGIC_VALUE) {
-    // First run — clear saved data (leave periods empty)
-    timerData.numPeriods = 0;
-    timerData.timerActive = false;
-    // write default back so next boot reads valid data
-    EEPROM.write(0, timerData.numPeriods);
-    EEPROM.write(1, timerData.timerActive ? 1 : 0);
-    EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
-    EEPROM.commit();
+void loadDataFromPreferences() {
+  if (prefs.getUChar(PREFS_MAGIC_KEY, 0) != PREFS_MAGIC_VALUE) {
+    if (migrateFromEepromIfPresent()) {
+      return;
+    }
+    timerData = {};
+    examData = {};
+    holidayData = {};
+    examModeEnabled = false;
+    saveDataToPreferences();
     return;
   }
 
-  timerData.numPeriods = EEPROM.read(0);
-  timerData.timerActive = EEPROM.read(1) == 1;
+  bool changed = false;
+  timerData = {};
+  examData = {};
+  holidayData = {};
+  examModeEnabled = prefs.getUChar(PREFS_EXAMEN_KEY, 0) == 1;
 
-  if (timerData.numPeriods > MAX_PERIODS) timerData.numPeriods = MAX_PERIODS;
+  if (!prefs.isKey(PREFS_EXAMEN_KEY)) changed = true;
 
-  for (int i = 0; i < timerData.numPeriods; i++) {
-    int addr = 2 + i * 6;
-    timerData.periods[i].day = EEPROM.read(addr);
-    timerData.periods[i].hour = EEPROM.read(addr + 1);
-    timerData.periods[i].minute = EEPROM.read(addr + 2);
-    timerData.periods[i].second = EEPROM.read(addr + 3);
-    timerData.periods[i].delaySeconds = (EEPROM.read(addr + 4) << 8) | EEPROM.read(addr + 5);
+  StoredTimerData storedTimer = {};
+  StoredExamData storedExam = {};
+  StoredHolidayData storedHoliday = {};
+
+  if (prefs.getBytesLength(PREFS_TIMER_KEY) == sizeof(storedTimer)) {
+    prefs.getBytes(PREFS_TIMER_KEY, &storedTimer, sizeof(storedTimer));
+  } else {
+    changed = true;
   }
 
-  ////Serial.print.println("Data loaded from EEPROM");
+  if (prefs.getBytesLength(PREFS_EXAM_KEY) == sizeof(storedExam)) {
+    prefs.getBytes(PREFS_EXAM_KEY, &storedExam, sizeof(storedExam));
+  } else {
+    changed = true;
+  }
+
+  if (prefs.getBytesLength(PREFS_HOLIDAY_KEY) == sizeof(storedHoliday)) {
+    prefs.getBytes(PREFS_HOLIDAY_KEY, &storedHoliday, sizeof(storedHoliday));
+  } else {
+    changed = true;
+  }
+
+  // Load normal timer data (sanitized + de-duplicated)
+  uint8_t rawCount = storedTimer.numPeriods;
+  timerData.timerActive = storedTimer.timerActive == 1;
+  if (rawCount > MAX_PERIODS) rawCount = MAX_PERIODS;
+
+  int validCount = 0;
+  for (int i = 0; i < rawCount; i++) {
+    Period p = storedTimer.periods[i];
+    if (!isValidStoredPeriod(p)) {
+      changed = true;
+      continue;
+    }
+    if (hasDuplicateInTimerData(p, validCount)) {
+      changed = true;
+      continue;
+    }
+    timerData.periods[validCount++] = p;
+  }
+  timerData.numPeriods = (uint8_t)validCount;
+  if (validCount != rawCount) changed = true;
+
+  // Load exam mode data
+  uint8_t rawExamCount = storedExam.numPeriods;
+  examData.timerActive = storedExam.timerActive == 1;
+  if (rawExamCount > EXAM_MAX_PERIODS) rawExamCount = EXAM_MAX_PERIODS;
+
+  int validExamCount = 0;
+  for (int i = 0; i < rawExamCount; i++) {
+    Period p = storedExam.periods[i];
+    if (!isValidStoredPeriod(p)) {
+      changed = true;
+      continue;
+    }
+    bool dup = false;
+    for (int j = 0; j < validExamCount; j++) {
+      if (periodEquals(examData.periods[j], p)) { dup = true; break; }
+    }
+    if (dup) {
+      changed = true;
+      continue;
+    }
+    examData.periods[validExamCount++] = p;
+  }
+  examData.numPeriods = (uint8_t)validExamCount;
+  if (validExamCount != rawExamCount) changed = true;
+
+  // Load holiday list
+  uint8_t rawHolidayCount = storedHoliday.numDates;
+  if (rawHolidayCount > HOLIDAY_MAX_DATES) rawHolidayCount = HOLIDAY_MAX_DATES;
+
+  int validHolidayCount = 0;
+  for (int i = 0; i < rawHolidayCount; i++) {
+    HolidayDate h = storedHoliday.dates[i];
+    if (h.year >= 2000 && h.year <= 2099 && h.month >= 1 && h.month <= 12 && h.day >= 1 &&
+        h.day <= daysInMonth(h.year, h.month)) {
+      holidayData.dates[validHolidayCount++] = h;
+    } else {
+      changed = true;
+    }
+  }
+  holidayData.numDates = validHolidayCount;
+  if (validHolidayCount != rawHolidayCount) changed = true;
+
+  if (changed) {
+    saveDataToPreferences();
+  }
+}
+
+bool migrateFromEepromIfPresent() {
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    return false;
+  }
+
+  bool migrated = false;
+  timerData = {};
+  examData = {};
+  holidayData = {};
+  examModeEnabled = false;
+
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) == EEPROM_MAGIC_VALUE) {
+    // Migrate from the newer EEPROM layout (4096 bytes).
+    uint8_t rawCount = EEPROM.read(TIMER_DATA_OFFSET);
+    timerData.timerActive = EEPROM.read(TIMER_DATA_OFFSET + 1) == 1;
+    if (rawCount > MAX_PERIODS) rawCount = MAX_PERIODS;
+
+    int validCount = 0;
+    for (int i = 0; i < rawCount; i++) {
+      int addr = TIMER_PERIODS_OFFSET + i * PERIOD_EEPROM_BYTES;
+      Period p;
+      p.day = EEPROM.read(addr);
+      p.hour = EEPROM.read(addr + 1);
+      p.minute = EEPROM.read(addr + 2);
+      p.second = EEPROM.read(addr + 3);
+      p.delaySeconds = (EEPROM.read(addr + 4) << 8) | EEPROM.read(addr + 5);
+
+      if (!isValidStoredPeriod(p)) continue;
+      if (hasDuplicateInTimerData(p, validCount)) continue;
+      timerData.periods[validCount++] = p;
+    }
+    timerData.numPeriods = (uint8_t)validCount;
+
+    examModeEnabled = EEPROM.read(EXAM_DATA_OFFSET) == 1;
+    uint8_t rawExamCount = EEPROM.read(EXAM_DATA_OFFSET + 1);
+    examData.timerActive = EEPROM.read(EXAM_DATA_OFFSET + 2) == 1;
+    if (rawExamCount > EXAM_MAX_PERIODS) rawExamCount = EXAM_MAX_PERIODS;
+
+    int validExamCount = 0;
+    for (int i = 0; i < rawExamCount; i++) {
+      int addr = EXAM_PERIODS_OFFSET + i * PERIOD_EEPROM_BYTES;
+      Period p;
+      p.day = EEPROM.read(addr);
+      p.hour = EEPROM.read(addr + 1);
+      p.minute = EEPROM.read(addr + 2);
+      p.second = EEPROM.read(addr + 3);
+      p.delaySeconds = (EEPROM.read(addr + 4) << 8) | EEPROM.read(addr + 5);
+
+      if (!isValidStoredPeriod(p)) continue;
+      bool dup = false;
+      for (int j = 0; j < validExamCount; j++) {
+        if (periodEquals(examData.periods[j], p)) { dup = true; break; }
+      }
+      if (dup) continue;
+      examData.periods[validExamCount++] = p;
+    }
+    examData.numPeriods = (uint8_t)validExamCount;
+
+    uint8_t rawHolidayCount = EEPROM.read(HOLIDAY_DATA_OFFSET);
+    if (rawHolidayCount > HOLIDAY_MAX_DATES) rawHolidayCount = HOLIDAY_MAX_DATES;
+    int validHolidayCount = 0;
+    for (int i = 0; i < rawHolidayCount; i++) {
+      int addr = HOLIDAY_DATA_OFFSET + 1 + i * HOLIDAY_ENTRY_BYTES;
+      uint16_t year = ((uint16_t)EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+      uint8_t month = EEPROM.read(addr + 2);
+      uint8_t day = EEPROM.read(addr + 3);
+      if (year >= 2000 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month)) {
+        holidayData.dates[validHolidayCount].year = year;
+        holidayData.dates[validHolidayCount].month = month;
+        holidayData.dates[validHolidayCount].day = day;
+        validHolidayCount++;
+      }
+    }
+    holidayData.numDates = validHolidayCount;
+    migrated = true;
+  } else if (EEPROM.read(EEPROM_OLD_MAGIC_ADDR) == EEPROM_OLD_MAGIC_VALUE) {
+    // Best-effort migration from old, overlapping layout.
+    timerData.timerActive = EEPROM.read(1) == 1;
+    examModeEnabled = EEPROM.read(EEPROM_OLD_EXAM_DATA_OFFSET) == 1;
+    examData.timerActive = EEPROM.read(EEPROM_OLD_EXAM_DATA_OFFSET + 2) == 1;
+
+    uint8_t oldTimerCount = EEPROM.read(0);
+    if (oldTimerCount > MAX_PERIODS) oldTimerCount = MAX_PERIODS;
+
+    // Old layout overlapped exam data starting at 400. Never read past the safe region.
+    const int oldMaxSafeTimer = (EEPROM_OLD_EXAM_DATA_OFFSET - 2) / PERIOD_EEPROM_BYTES; // 66
+    if ((int)oldTimerCount > oldMaxSafeTimer) oldTimerCount = (uint8_t)oldMaxSafeTimer;
+
+    for (int i = 0; i < oldTimerCount; i++) {
+      int addr = 2 + i * PERIOD_EEPROM_BYTES;
+      Period p;
+      p.day = EEPROM.read(addr);
+      p.hour = EEPROM.read(addr + 1);
+      p.minute = EEPROM.read(addr + 2);
+      p.second = EEPROM.read(addr + 3);
+      p.delaySeconds = (EEPROM.read(addr + 4) << 8) | EEPROM.read(addr + 5);
+
+      if (!isValidStoredPeriod(p)) continue;
+      if (hasDuplicateInTimerData(p, timerData.numPeriods)) continue;
+      timerData.periods[timerData.numPeriods++] = p;
+    }
+
+    uint8_t oldExamCount = EEPROM.read(EEPROM_OLD_EXAM_DATA_OFFSET + 1);
+    if (oldExamCount > EXAM_MAX_PERIODS) oldExamCount = EXAM_MAX_PERIODS;
+    for (int i = 0; i < oldExamCount; i++) {
+      int addr = EEPROM_OLD_EXAM_DATA_OFFSET + 3 + i * PERIOD_EEPROM_BYTES;
+      Period p;
+      p.day = EEPROM.read(addr);
+      p.hour = EEPROM.read(addr + 1);
+      p.minute = EEPROM.read(addr + 2);
+      p.second = EEPROM.read(addr + 3);
+      p.delaySeconds = (EEPROM.read(addr + 4) << 8) | EEPROM.read(addr + 5);
+
+      if (!isValidStoredPeriod(p)) continue;
+      bool dup = false;
+      for (int j = 0; j < examData.numPeriods; j++) {
+        if (periodEquals(examData.periods[j], p)) { dup = true; break; }
+      }
+      if (dup) continue;
+      if (examData.numPeriods < EXAM_MAX_PERIODS) {
+        examData.periods[examData.numPeriods++] = p;
+      }
+    }
+
+    uint8_t oldHolidayCount = EEPROM.read(EEPROM_OLD_HOLIDAY_DATA_OFFSET);
+    if (oldHolidayCount > HOLIDAY_MAX_DATES) oldHolidayCount = HOLIDAY_MAX_DATES;
+    for (int i = 0; i < oldHolidayCount; i++) {
+      int addr = EEPROM_OLD_HOLIDAY_DATA_OFFSET + 1 + i * HOLIDAY_ENTRY_BYTES;
+      uint16_t year = ((uint16_t)EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+      uint8_t month = EEPROM.read(addr + 2);
+      uint8_t day = EEPROM.read(addr + 3);
+
+      if (!(year >= 2000 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month))) {
+        continue;
+      }
+      bool exists = false;
+      for (int j = 0; j < holidayData.numDates; j++) {
+        const HolidayDate &h = holidayData.dates[j];
+        if (h.year == year && h.month == month && h.day == day) { exists = true; break; }
+      }
+      if (exists) continue;
+      if (holidayData.numDates < HOLIDAY_MAX_DATES) {
+        holidayData.dates[holidayData.numDates].year = year;
+        holidayData.dates[holidayData.numDates].month = month;
+        holidayData.dates[holidayData.numDates].day = day;
+        holidayData.numDates++;
+      }
+    }
+    migrated = true;
+  }
+
+  if (migrated) {
+    saveDataToPreferences();
+  }
+  EEPROM.end();
+  return migrated;
 }
